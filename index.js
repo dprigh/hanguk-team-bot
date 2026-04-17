@@ -22,6 +22,13 @@
 // GUILD_ID=여기에_서버_ID
 // RECRUIT_CHANNEL_ID=여기에_팀모집_텍스트채널_ID
 
+console.log("ENV CHECK", {
+  hasToken: !!process.env.DISCORD_TOKEN,
+  hasClientId: !!process.env.CLIENT_ID,
+  hasGuildId: !!process.env.GUILD_ID,
+  hasRecruitChannelId: !!process.env.RECRUIT_CHANNEL_ID,
+});
+
 require('dotenv').config();
 const {
   ActionRowBuilder,
