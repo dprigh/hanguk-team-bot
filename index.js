@@ -1,30 +1,22 @@
-// 한국관 서버용 Team Finder 봇 (무조건 새 글 생성형 / 고속 단순 버전)
+// 한국관 서버용 Team Finder 봇 (초경량 / 무조건 새 글 생성 전용)
 //
-// 설계 방향
-// 1) /팀 실행 시 현재 음성채널 기준으로 공개 모집글을 '새로' 생성
-// 2) 기존 모집글이 있으면 수정하지 않고 삭제 후 새 글 생성
-// 3) 자동 상태 추적 없음
-// 4) 버튼은 음성채널 링크 버튼 사용
-// 5) 개인 확인 메시지는 즉시 삭제 시도
-// 6) 구조를 최대한 단순하게 해서 무료 서버에서도 가볍게 동작하도록 구성
+// 동작 원칙
+// 1) /팀 실행 시 현재 음성채널 기준으로 모집글을 '항상 새로 생성'
+// 2) 이전 모집글 삭제 안 함
+// 3) 자동 추적 없음
+// 4) 버튼 클릭 처리 없음 (링크 버튼만 사용)
+// 5) 개인 안내 메시지 생성 안 함
 //
-// 주의
-// - 디스코드 앱 명령 사용 흔적(예: '/팀(을)를 사용함')은 클라이언트 표시라 완전 제거 불가
-// - 그 아래 개인 응답 메시지는 삭제 시도
-// - 링크 버튼은 채널 링크를 여는 방식이며, 디스코드 클라이언트 환경에 따라 체감 동작이 다를 수 있음
+// 중요
+// - 이전 글은 남아 있으므로 채널에 모집글이 누적될 수 있음
+// - '/팀을 사용함' 같은 디스코드 앱 명령 흔적은 클라이언트 표시라 제거 불가
+// - 그 외 개인 확인 메시지는 삭제 시도
 //
-// 필수 권한
-// - View Channels
-// - Send Messages
-// - Embed Links
-// - Read Message History
-// - Use Application Commands
-//
-// .env 예시
-// DISCORD_TOKEN=여기에_봇_토큰
-// CLIENT_ID=여기에_앱_CLIENT_ID
-// GUILD_ID=여기에_서버_ID
-// RECRUIT_CHANNEL_ID=여기에_팀모집_텍스트채널_ID
+// .env
+// DISCORD_TOKEN=...
+// CLIENT_ID=...
+// GUILD_ID=...
+// RECRUIT_CHANNEL_ID=...
 
 require('dotenv').config();
 const {
@@ -59,9 +51,7 @@ const client = new Client({
   ],
 });
 
-// userId -> { guildId, recruitTextChannelId, messageId }
-const recruitByUser = new Map();
-// guildId -> recruit text channel
+// guildId -> recruit text channel cache
 const recruitChannelCache = new Map();
 
 const commands = [
@@ -75,10 +65,6 @@ const commands = [
         .setRequired(true)
     ),
 ];
-
-function isMissingAccessError(error) {
-  return error?.code === 50001 || error?.rawError?.code === 50001;
-}
 
 function buildVoiceChannelLink(guildId, channelId) {
   return `https://discord.com/channels/${guildId}/${channelId}`;
@@ -164,43 +150,12 @@ async function getRecruitTextChannel(guild) {
   return channel;
 }
 
-async function deletePreviousRecruit(userId) {
-  const previous = recruitByUser.get(userId);
-  if (!previous) return;
-
-  recruitByUser.delete(userId);
-
-  try {
-    const guild = client.guilds.cache.get(previous.guildId);
-    if (!guild) return;
-
-    const channel = guild.channels.cache.get(previous.recruitTextChannelId)
-      ?? await guild.channels.fetch(previous.recruitTextChannelId).catch(() => null);
-    if (!channel || !channel.isTextBased()) return;
-
-    const message = await channel.messages.fetch(previous.messageId).catch(() => null);
-    if (message) {
-      await message.delete().catch(() => null);
-    }
-  } catch {
-    // 기존 글 삭제 실패는 조용히 무시
-  }
-}
-
 async function createFreshRecruit({ guild, member, voiceChannel, description }) {
   const recruitTextChannel = await getRecruitTextChannel(guild);
 
-  await deletePreviousRecruit(member.id);
-
-  const message = await recruitTextChannel.send({
+  await recruitTextChannel.send({
     embeds: [buildRecruitEmbed({ member, voiceChannel, description })],
     components: [buildRecruitButtons(guild.id, voiceChannel.id)],
-  });
-
-  recruitByUser.set(member.id, {
-    guildId: guild.id,
-    recruitTextChannelId: recruitTextChannel.id,
-    messageId: message.id,
   });
 }
 
@@ -218,25 +173,15 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!guild || !member || !('voice' in member)) return;
 
     const voiceChannel = member.voice.channel;
-    if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
-      return;
-    }
+    if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) return;
 
     const description = interaction.options.getString('설명', true).trim();
 
-    // 상호작용 만료 방지용 최소 응답 후 바로 삭제
     await interaction.deferReply().catch(() => null);
-
     await createFreshRecruit({ guild, member, voiceChannel, description });
-
     await interaction.deleteReply().catch(() => null);
   } catch (error) {
-    if (isMissingAccessError(error)) {
-      console.error('권한 부족(Missing Access): 모집 채널 권한을 확인해 주세요.', error.message || error);
-    } else {
-      console.error('Interaction 처리 중 오류:', error.message || error);
-    }
-
+    console.error('Interaction 처리 중 오류:', error?.message || error);
     try {
       if (!interaction.replied && !interaction.deferred) {
         await interaction.deferReply().catch(() => null);
@@ -253,7 +198,7 @@ client.on(Events.InteractionCreate, async interaction => {
     await registerCommands();
     await client.login(TOKEN);
   } catch (error) {
-    console.error('초기 실행 오류:', error.message || error);
+    console.error('초기 실행 오류:', error?.message || error);
     process.exit(1);
   }
 })();
