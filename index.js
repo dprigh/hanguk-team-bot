@@ -1,15 +1,18 @@
-// 한국관 서버용 Team Finder 봇 (속도 최적화 + 안내 메시지 최소화 버전)
+// 한국관 서버용 Team Finder 봇 (단발 고지 + 채널 링크 버튼 버전)
 //
-// 목표
-// 1) /팀 사용 시 개인에게만 보이는 확인 메시지(ephemeral) 제거
-// 2) 불필요한 fetch 최소화
-// 3) 메시지 수정/재생성 로직 단순화
-// 4) VoiceStateUpdate 디바운스 적용으로 과도한 API 호출 방지
-// 5) 기존 모집글이 없으면 자동 재생성
-// 6) 버튼 클릭 시:
-//    - 이미 음성채널에 있는 사람은 즉시 이동
-//    - 음성채널 미접속자는 자동 접속 불가 (Discord 한계)
-//      -> 별도 메시지 없이 조용히 무시하지 않고, 최소한의 짧은 안내만 표시
+// 변경 목표
+// 1) /팀 명령을 쓰면 현재 음성채널 기준으로 모집글을 1회 등록/갱신
+// 2) 이후 모집자가 음성채널을 옮겨도 자동 추적/자동 수정하지 않음
+// 3) 버튼은 '즉시 이동' 기능이 아니라, 해당 음성채널 링크로 연결
+//    -> 사용자가 채널명 링크를 누를 때와 같은 방식으로 동작
+// 4) /팀 사용 시 불필요한 개인 확인 메시지는 최대한 제거
+// 5) /팀닫기 제거 유지
+// 6) 기존 모집글이 있으면 새로 만들지 않고 같은 메시지를 갱신
+// 7) 기존 메시지가 삭제된 상태면 자동으로 새 메시지 재생성
+//
+// 참고
+// - Discord 특성상 링크 버튼은 채널로 이동/열기 동작이며, 실제 음성 자동 접속을 100% 보장하지는 않음
+// - 다만 채널명 링크를 누르는 것과 같은 방향의 UX를 버튼으로 줄 수 있음
 //
 // 필수 권한
 // - View Channels
@@ -17,8 +20,6 @@
 // - Embed Links
 // - Read Message History
 // - Use Application Commands
-// - Connect
-// - Move Members
 //
 // .env 예시
 // DISCORD_TOKEN=여기에_봇_토큰
@@ -62,10 +63,8 @@ const client = new Client({
 
 // userId -> recruit 정보
 const recruitByUser = new Map();
-// userId -> debounce timeout
-const updateTimers = new Map();
-// 단순 채널 캐시
-const textChannelCache = new Map(); // guildId -> channel
+// guildId -> recruit text channel cache
+const textChannelCache = new Map();
 
 const commands = [
   new SlashCommandBuilder()
@@ -96,6 +95,10 @@ function getVoiceCapacityText(channel) {
   const current = getVoiceMemberCount(channel);
   const max = channel.userLimit && channel.userLimit > 0 ? channel.userLimit : '∞';
   return `${current}명 / ${max}명`;
+}
+
+function buildVoiceChannelLink(guildId, channelId) {
+  return `https://discord.com/channels/${guildId}/${channelId}`;
 }
 
 function buildRecruitEmbed({ member, voiceChannel, description }) {
@@ -133,12 +136,12 @@ function buildRecruitEmbed({ member, voiceChannel, description }) {
     .setTimestamp();
 }
 
-function buildRecruitButtons(ownerId, channelId) {
+function buildRecruitButtons(guildId, channelId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`join_voice:${ownerId}:${channelId}`)
-      .setLabel('바로 참가')
-      .setStyle(ButtonStyle.Success)
+      .setLabel('바로 입장')
+      .setStyle(ButtonStyle.Link)
+      .setURL(buildVoiceChannelLink(guildId, channelId))
   );
 }
 
@@ -177,9 +180,9 @@ async function getRecruitTextChannel(guild) {
   return recruitTextChannel;
 }
 
-async function createRecruitMessage(recruitTextChannel, member, voiceChannel, description) {
+async function createRecruitMessage(recruitTextChannel, guild, member, voiceChannel, description) {
   const embed = buildRecruitEmbed({ member, voiceChannel, description });
-  const buttons = buildRecruitButtons(member.id, voiceChannel.id);
+  const buttons = buildRecruitButtons(guild.id, voiceChannel.id);
 
   return recruitTextChannel.send({
     embeds: [embed],
@@ -202,7 +205,7 @@ async function upsertRecruit({ guild, member, voiceChannel, description }) {
       try {
         await oldMessage.edit({
           embeds: [buildRecruitEmbed({ member, voiceChannel, description })],
-          components: [buildRecruitButtons(member.id, voiceChannel.id)],
+          components: [buildRecruitButtons(guild.id, voiceChannel.id)],
         });
 
         const updated = {
@@ -222,7 +225,7 @@ async function upsertRecruit({ guild, member, voiceChannel, description }) {
     }
   }
 
-  const newMessage = await createRecruitMessage(recruitTextChannel, member, voiceChannel, description);
+  const newMessage = await createRecruitMessage(recruitTextChannel, guild, member, voiceChannel, description);
   const nextRecruit = {
     guildId: guild.id,
     recruitTextChannelId: recruitTextChannel.id,
@@ -236,192 +239,46 @@ async function upsertRecruit({ guild, member, voiceChannel, description }) {
   return { mode: previous ? 'recreated' : 'created', recruit: nextRecruit };
 }
 
-async function deleteRecruitByUserId(userId, reason = '모집 종료') {
-  const recruit = recruitByUser.get(userId);
-  if (!recruit) return false;
-
-  recruitByUser.delete(userId);
-  const timer = updateTimers.get(userId);
-  if (timer) {
-    clearTimeout(timer);
-    updateTimers.delete(userId);
-  }
-
-  try {
-    const guild = client.guilds.cache.get(recruit.guildId) ?? await client.guilds.fetch(recruit.guildId);
-    const channel = guild.channels.cache.get(recruit.recruitTextChannelId) ?? await guild.channels.fetch(recruit.recruitTextChannelId).catch(() => null);
-    if (channel?.isTextBased()) {
-      const message = await safeFetchMessage(channel, recruit.messageId);
-      if (message) await message.delete().catch(() => null);
-    }
-  } catch {
-    // 조용히 무시
-  }
-
-  console.log(`[모집 삭제] user=${userId}, reason=${reason}`);
-  return true;
-}
-
-async function updateRecruitMessage(userId) {
-  const recruit = recruitByUser.get(userId);
-  if (!recruit) return;
-
-  const guild = client.guilds.cache.get(recruit.guildId) ?? await client.guilds.fetch(recruit.guildId).catch(() => null);
-  if (!guild) return;
-
-  const member = guild.members.cache.get(userId) ?? await guild.members.fetch(userId).catch(() => null);
-  if (!member) {
-    await deleteRecruitByUserId(userId, '멤버 조회 실패');
-    return;
-  }
-
-  const voiceChannel = guild.channels.cache.get(recruit.voiceChannelId) ?? await guild.channels.fetch(recruit.voiceChannelId).catch(() => null);
-  if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
-    await deleteRecruitByUserId(userId, '음성채널 없음');
-    return;
-  }
-
-  if (!voiceChannel.members.has(userId)) {
-    await deleteRecruitByUserId(userId, '모집자가 채널 이탈');
-    return;
-  }
-
-  const recruitTextChannel = await getRecruitTextChannel(guild).catch(error => {
-    console.error('모집 채널 조회 오류:', error.message);
-    return null;
-  });
-  if (!recruitTextChannel) return;
-
-  const message = await safeFetchMessage(recruitTextChannel, recruit.messageId);
-  if (!message) {
-    const newMessage = await createRecruitMessage(recruitTextChannel, member, voiceChannel, recruit.description).catch(error => {
-      console.error('모집 메시지 재생성 실패:', error.message || error);
-      return null;
-    });
-
-    if (!newMessage) return;
-    recruit.messageId = newMessage.id;
-    recruit.updatedAt = Date.now();
-    recruitByUser.set(userId, recruit);
-    return;
-  }
-
-  try {
-    await message.edit({
-      embeds: [buildRecruitEmbed({ member, voiceChannel, description: recruit.description })],
-      components: [buildRecruitButtons(userId, voiceChannel.id)],
-    });
-  } catch (error) {
-    if (isUnknownMessageError(error)) {
-      const newMessage = await createRecruitMessage(recruitTextChannel, member, voiceChannel, recruit.description).catch(() => null);
-      if (newMessage) {
-        recruit.messageId = newMessage.id;
-        recruit.updatedAt = Date.now();
-        recruitByUser.set(userId, recruit);
-      }
-      return;
-    }
-    console.error('모집 메시지 수정 실패:', error.message || error);
-  }
-}
-
-function scheduleRecruitUpdate(userId, delay = 700) {
-  const prevTimer = updateTimers.get(userId);
-  if (prevTimer) clearTimeout(prevTimer);
-
-  const timer = setTimeout(async () => {
-    updateTimers.delete(userId);
-    await updateRecruitMessage(userId).catch(error => {
-      console.error('디바운스 업데이트 실패:', error.message || error);
-    });
-  }, delay);
-
-  updateTimers.set(userId, timer);
-}
-
 client.once(Events.ClientReady, readyClient => {
   console.log(`로그인 완료: ${readyClient.user.tag}`);
 });
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === '팀') {
-        const guild = interaction.guild;
-        const member = interaction.member;
-        const description = interaction.options.getString('설명', true).trim();
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== '팀') return;
 
-        if (!guild || !member || !('voice' in member)) return;
+    const guild = interaction.guild;
+    const member = interaction.member;
+    const description = interaction.options.getString('설명', true).trim();
 
-        const voiceChannel = member.voice.channel;
-        if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
-          // 개인 메시지조차 생략하여 최대한 조용하게 처리
-          return;
-        }
+    if (!guild || !member || !('voice' in member)) return;
 
-        // 사용자가 기다리는 체감 시간을 줄이기 위해 먼저 defer
-        await interaction.deferReply({ withResponse: false }).catch(() => null);
-
-        await upsertRecruit({ guild, member, voiceChannel, description });
-
-        // 최종 개인 확인 메시지도 없애기 위해 deleteReply 시도
-        if (interaction.deferred || interaction.replied) {
-          await interaction.deleteReply().catch(() => null);
-        }
-        return;
-      }
+    const voiceChannel = member.voice.channel;
+    if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
+      // 음성채널에 없으면 조용히 종료
+      return;
     }
 
-    if (interaction.isButton()) {
-      if (interaction.customId.startsWith('join_voice:')) {
-        const [, , channelId] = interaction.customId.split(':');
-        const guild = interaction.guild;
-        if (!guild) return;
+    // 사용 즉시 상단 응답 흔적을 최소화하기 위해 defer 후 바로 삭제 시도
+    await interaction.deferReply({ withResponse: false }).catch(() => null);
 
-        const targetChannel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
-        if (!targetChannel || targetChannel.type !== ChannelType.GuildVoice) return;
+    await upsertRecruit({ guild, member, voiceChannel, description });
 
-        const botMember = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
-        const botPerms = targetChannel.permissionsFor(botMember);
-        if (!botPerms?.has(PermissionFlagsBits.MoveMembers) || !botPerms?.has(PermissionFlagsBits.Connect)) {
-          return;
-        }
-
-        const clicker = guild.members.cache.get(interaction.user.id) ?? await guild.members.fetch(interaction.user.id).catch(() => null);
-        if (!clicker) return;
-
-        const memberPerms = targetChannel.permissionsFor(clicker);
-        if (!memberPerms?.has(PermissionFlagsBits.Connect)) return;
-
-        // 음성채널 미접속자는 Discord 한계상 즉시 접속 불가
-        if (!clicker.voice?.channel) {
-          // 최소 안내만 남기고 끝냄
-          await interaction.reply({
-            content: `직접 입장해 주세요: <#${targetChannel.id}>`,
-            withResponse: false,
-          }).catch(() => null);
-          return;
-        }
-
-        await clicker.voice.setChannel(targetChannel).catch(() => null);
-
-        // 이동 성공 후 굳이 개인 메시지를 남기지 않음
-        if (!interaction.replied && !interaction.deferred) {
-          await interaction.deferUpdate().catch(() => null);
-        }
-        return;
-      }
+    if (interaction.deferred || interaction.replied) {
+      await interaction.deleteReply().catch(() => null);
     }
   } catch (error) {
     if (isMissingAccessError(error)) {
-      console.error('권한 부족(Missing Access): 채널 권한을 확인해 주세요.', error.message || error);
+      console.error('권한 부족(Missing Access): 모집 채널 권한을 확인해 주세요.', error.message || error);
     } else {
       console.error('Interaction 처리 중 오류:', error.message || error);
     }
 
     try {
       if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-        await interaction.deferUpdate().catch(() => null);
+        await interaction.deferReply({ withResponse: false }).catch(() => null);
+        await interaction.deleteReply().catch(() => null);
       }
     } catch {
       // 무시
@@ -429,35 +286,9 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-  try {
-    const changedUserId = newState.id;
-
-    if (recruitByUser.has(changedUserId)) {
-      const recruit = recruitByUser.get(changedUserId);
-
-      if (newState.channelId && newState.channelId !== recruit.voiceChannelId) {
-        recruit.voiceChannelId = newState.channelId;
-        recruit.updatedAt = Date.now();
-        recruitByUser.set(changedUserId, recruit);
-      }
-
-      scheduleRecruitUpdate(changedUserId);
-    }
-
-    const relatedChannelIds = new Set();
-    if (oldState.channelId) relatedChannelIds.add(oldState.channelId);
-    if (newState.channelId) relatedChannelIds.add(newState.channelId);
-
-    for (const [userId, recruit] of recruitByUser.entries()) {
-      if (relatedChannelIds.has(recruit.voiceChannelId)) {
-        scheduleRecruitUpdate(userId);
-      }
-    }
-  } catch (error) {
-    console.error('VoiceStateUpdate 처리 오류:', error.message || error);
-  }
-});
+// 자동 상태 추적 기능 제거
+// 모집자가 음성채널을 옮겨도 임베드는 자동으로 바뀌지 않음
+// 다시 /팀 명령을 써야 새 채널 기준으로 갱신됨
 
 (async () => {
   try {
