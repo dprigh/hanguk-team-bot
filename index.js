@@ -19,7 +19,6 @@
 // RECRUIT_CHANNEL_ID=...
 
 require('dotenv').config();
-const express = require('express');
 
 const {
   ActionRowBuilder,
@@ -36,13 +35,14 @@ const {
   SlashCommandBuilder,
 } = require('discord.js');
 
+const express = require('express');
+
 const app = express();
+const PORT = process.env.PORT || 10000;
 
 app.get('/', (req, res) => {
   res.send('Team Finder Bot is running!');
 });
-
-const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Web server running on port ${PORT}`);
