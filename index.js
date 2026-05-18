@@ -1,4 +1,4 @@
-// 한국관 서버용 Team Finder 봇 (초경량 / 무조건 새 글 생성 전용)
+// 한국WAR 서버용 Team Finder 봇 (초경량 / 무조건 새 글 생성 전용)
 //
 // 동작 원칙
 // 1) /팀 실행 시 현재 음성채널 기준으로 모집글을 '항상 새로 생성'
@@ -19,6 +19,8 @@
 // RECRUIT_CHANNEL_ID=...
 
 require('dotenv').config();
+const express = require('express');
+
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -33,6 +35,19 @@ const {
   Routes,
   SlashCommandBuilder,
 } = require('discord.js');
+
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('Team Finder Bot is running!');
+});
+
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Web server running on port ${PORT}`);
+});
+
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -100,7 +115,7 @@ function buildRecruitEmbed({ member, voiceChannel, description }) {
       { name: '멤버', value: getVoiceCapacityText(voiceChannel), inline: true },
       { name: '설명', value: description, inline: false },
     )
-    .setFooter({ text: '한국관 Team Finder' })
+    .setFooter({ text: '한국WAR Team Finder' })
     .setTimestamp();
 }
 
